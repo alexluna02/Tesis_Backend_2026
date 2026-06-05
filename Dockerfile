@@ -29,7 +29,7 @@ RUN grep -vE "^(torch|torchvision)" requirements.txt > /tmp/req.txt && \
 
 COPY . .
 
-EXPOSE 8000
+EXPOSE 7860
 
-# Render injects $PORT at runtime; fall back to 8000 locally
-CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-8000} --workers 1
+# Render injects $PORT; HuggingFace uses 7860; local fallback 8000
+CMD uvicorn main:app --host 0.0.0.0 --port ${PORT:-7860} --workers 1

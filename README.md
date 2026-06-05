@@ -1,3 +1,13 @@
+---
+title: AgroScan API
+emoji: 🌿
+colorFrom: green
+colorTo: blue
+sdk: docker
+app_port: 7860
+pinned: false
+---
+
 # ProyectoTesis - Detección de Enfermedades en Maíz
 
 API con FastAPI para segmentación de enfermedades en hojas de maíz usando DeepLabV3+.
