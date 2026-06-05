@@ -48,7 +48,7 @@ def build_model(device: Optional[torch.device] = None) -> torch.nn.Module:
     device = device or CFG.device
     model = smp.DeepLabV3Plus(
         encoder_name="mit_b1",
-        encoder_weights="imagenet",
+        encoder_weights=None,  # no descargar pesos de HuggingFace — load_state_dict los sobreescribe igual
         classes=CFG.num_classes,
     )
     return model.to(device)
