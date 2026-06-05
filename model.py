@@ -1,4 +1,5 @@
 import base64
+import gc
 import io
 import cv2
 from typing import Dict, List, Optional, Tuple
@@ -157,10 +158,12 @@ def generate_xai(
     
     tensor = preprocess_image(image).to(CFG.device)
 
-    # Obtener predicción
+    # Obtener predicción y liberar logits antes de GradCAM (ahorra ~150 MB en RAM limitada)
     with torch.no_grad():
         logits = model(tensor)
         preds = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
+    del logits
+    gc.collect()
 
     # Determinar clase objetivo (dominate sin contar fondo)
     if target_class is None:
@@ -186,9 +189,11 @@ def generate_xai(
         target_mask = (preds == target_class_idx).astype(np.uint8)
         targets = [SemanticSegmentationTarget(category=target_class_idx, mask=target_mask)]
         
-        # Generar CAM
+        # Generar CAM y liberar tensor de entrada inmediatamente
         with GradCAM(model=model, target_layers=target_layers) as cam:
             grayscale_cam = cam(input_tensor=tensor, targets=targets)[0, :]
+        del tensor
+        gc.collect()
 
         # Asegurar dimensiones (DeepLabV3+ reduce espacial) para pintar overlay
         if grayscale_cam.shape != (CFG.img_size, CFG.img_size):
