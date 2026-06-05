@@ -1,0 +1,30 @@
+# Virtual environments
+.venv/
+.venv-1/
+venv/
+env/
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+*.pyd
+
+# Secrets – never bake .env into the image
+.env
+.env.*
+
+# Git metadata
+.git/
+.gitignore
+
+# Frontend source (deployed separately to Vercel)
+FrontReactIA/node_modules/
+FrontReactIA/dist/
+FrontReactIA/.env
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

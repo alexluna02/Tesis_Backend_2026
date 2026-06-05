@@ -1,0 +1,42 @@
+services:
+  - type: web
+    name: agroscan-api
+    runtime: docker
+    plan: starter          # $7/month · 512 MB RAM
+    # If you get out-of-memory errors during inference change plan to:
+    #   standard           # $25/month · 2 GB RAM (safe for PyTorch)
+    healthCheckPath: /health
+    envVars:
+      # Database – auto-filled from the database block below
+      - key: DATABASE_URL
+        fromDatabase:
+          name: agroscan-db
+          property: connectionString
+
+      # Model weights file (relative to /app inside the container)
+      - key: MODEL_PATH
+        value: best_model.pth
+
+      # JWT – Render generates a random secure value automatically
+      - key: JWT_SECRET_KEY
+        generateValue: true
+      - key: ACCESS_TOKEN_EXPIRE_MINUTES
+        value: "30"
+      - key: REFRESH_TOKEN_EXPIRE_DAYS
+        value: "30"
+
+      # SMTP – set manually in the Render dashboard after first deploy
+      - key: SMTP_HOST
+        value: smtp.gmail.com
+      - key: SMTP_PORT
+        value: "587"
+      - key: SMTP_USER
+        sync: false   # fill in the dashboard: your Gmail address
+      - key: SMTP_PASSWORD
+        sync: false   # fill in the dashboard: Gmail App Password
+
+databases:
+  - name: agroscan-db
+    plan: free          # free PostgreSQL · expires after 90 days
+    databaseName: bd_tesis
+    user: agroscan_user

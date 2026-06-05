@@ -1,0 +1,17 @@
+fastapi
+uvicorn[standard]
+python-multipart
+python-dotenv
+grad-cam
+torch
+torchvision
+segmentation-models-pytorch
+albumentations
+timm
+pillow
+sqlalchemy
+asyncpg
+bcrypt
+python-jose[cryptography]
+email-validator
+httpx
