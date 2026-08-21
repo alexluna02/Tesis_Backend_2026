@@ -17,10 +17,11 @@ DATABASE_PASSWORD = os.getenv("DATABASE_PASSWORD", "postgres")
 DATABASE_HOST = os.getenv("DATABASE_HOST", "localhost")
 DATABASE_PORT = os.getenv("DATABASE_PORT", "5432")
 
-DATABASE_URL = os.getenv(
+_raw_url = os.getenv(
     "DATABASE_URL",
     f"postgresql+asyncpg://{DATABASE_USER}:{DATABASE_PASSWORD}@{DATABASE_HOST}:{DATABASE_PORT}/{DATABASE_NAME}",
-).strip().replace("\n", "").replace("\r", "").replace(" ", "")
+)
+DATABASE_URL = _raw_url.strip().split("\n")[0].split("\r")[0].strip()
 
 # Render (and many cloud providers) supply postgresql:// or postgres://
 # but SQLAlchemy async needs the postgresql+asyncpg:// dialect prefix.
