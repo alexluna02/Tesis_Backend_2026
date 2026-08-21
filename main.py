@@ -115,7 +115,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-MODEL_PATH = os.environ.get("MODEL_PATH", "best_model.pth")
+MODEL_PATH = os.environ.get("MODEL_PATH", "Mit_B0_768Px.pth")
 model = None
 
 

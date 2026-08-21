@@ -24,7 +24,7 @@ print(f"[model.py] XAI_AVAILABLE={XAI_AVAILABLE}, GRADCAM_ERROR={GRADCAM_ERROR}"
 
 
 class CFG:
-    img_size: int = 384
+    img_size: int = 768
     num_classes: int = 4
     class_names: List[str] = [
         "Fondo_y_Sana",
@@ -48,7 +48,7 @@ def build_model(device: Optional[torch.device] = None) -> torch.nn.Module:
     """Crea el modelo DeepLabV3+ para inferencia."""
     device = device or CFG.device
     model = smp.DeepLabV3Plus(
-        encoder_name="mit_b1",
+        encoder_name="mit_b0",
         encoder_weights=None,  # no descargar pesos de HuggingFace — load_state_dict los sobreescribe igual
         classes=CFG.num_classes,
     )
