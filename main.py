@@ -17,6 +17,7 @@ from sqlalchemy.orm import selectinload
 
 import auth
 import database
+import mercado
 import schemas
 from model import CFG, GRADCAM_ERROR, XAI_AVAILABLE, generate_xai, load_model, predict_from_bytes
 
@@ -156,6 +157,15 @@ async def startup_event():
             await database.seed_enfermedades(session)
     except Exception as exc:
         print(f"[startup] Error inicializando la base de datos: {exc}")
+
+    # ── Seed market prices (choclo diario + banda oficial de maíz duro) ──────
+    try:
+        async with database.async_session() as session:
+            await mercado.ensure_maiz_duro_seed(session)
+            insertados = await mercado.sync_choclo_prices(session)
+            print(f"[startup] Precios de choclo sincronizados: {insertados} día(s) nuevo(s)")
+    except Exception as exc:
+        print(f"[startup] Error sincronizando precios de mercado: {exc}")
 
 
 @app.get("/", tags=["general"])
@@ -447,6 +457,33 @@ async def get_stats(current_user: database.Usuario = Depends(auth.get_current_ac
         cultivos_sanos=sanos,
         afectacion_promedio=promedio,
     )
+
+
+@app.get("/mercado/resumen", response_model=schemas.MercadoResumen, tags=["mercado"])
+async def get_mercado_resumen(db: AsyncSession = Depends(database.get_db)):
+    try:
+        await mercado.sync_choclo_prices(db, days_back=3)
+    except Exception as exc:
+        print(f"[mercado] Error sincronizando precios: {exc}")
+    resumen = await mercado.get_resumen(db)
+    return resumen
+
+
+@app.get("/mercado/historico", response_model=List[schemas.PrecioPunto], tags=["mercado"])
+async def get_mercado_historico(
+    producto: str = "choclo",
+    dias: int = 30,
+    db: AsyncSession = Depends(database.get_db),
+):
+    if producto not in ("choclo", "maiz_duro"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Producto inválido. Use 'choclo' o 'maiz_duro'.")
+    dias = max(1, min(dias, 365))
+    if producto == "choclo":
+        try:
+            await mercado.sync_choclo_prices(db, days_back=3)
+        except Exception as exc:
+            print(f"[mercado] Error sincronizando precios: {exc}")
+    return await mercado.get_historico(db, producto, dias)
 
 
 @app.post("/predict/segmentation", tags=["inference"])

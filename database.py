@@ -6,7 +6,7 @@ from dotenv import load_dotenv
 load_dotenv()
 
 from sqlalchemy import (Boolean, Column, DateTime, ForeignKey, Integer, SmallInteger,
-                        String, Text, func, text, Numeric)
+                        String, Text, UniqueConstraint, func, text, Numeric)
 from sqlalchemy.dialects.postgresql import UUID, ENUM
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -132,6 +132,26 @@ class Analisis(Base):
 
     user: Mapped[Usuario] = relationship("Usuario", back_populates="analisis")
     enfermedad: Mapped[Enfermedad] = relationship("Enfermedad")
+
+
+class PrecioMercado(Base):
+    __tablename__ = "precios_mercado"
+    __table_args__ = (UniqueConstraint("producto", "fecha", name="uq_precio_producto_fecha"),)
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("uuid_generate_v4()"),
+    )
+    producto: Mapped[str] = mapped_column(String(30), nullable=False)  # 'choclo' | 'maiz_duro'
+    fuente: Mapped[str] = mapped_column(String(120), nullable=False)
+    presentacion: Mapped[str] = mapped_column(String(60), nullable=True)
+    precio: Mapped[float] = mapped_column(Numeric(8, 2), nullable=False)
+    precio_min: Mapped[float] = mapped_column(Numeric(8, 2), nullable=True)
+    precio_max: Mapped[float] = mapped_column(Numeric(8, 2), nullable=True)
+    variedades: Mapped[str] = mapped_column(Text, nullable=True)
+    fecha: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False)
+    created_at: Mapped[str] = mapped_column(DateTime(timezone=False), server_default=func.now())
 
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:

@@ -111,3 +111,42 @@ class StatsResponse(BaseModel):
     detecciones_enfermedad: int
     cultivos_sanos: int
     afectacion_promedio: Optional[Decimal] = None
+
+
+class PrecioPunto(BaseModel):
+    fecha: datetime
+    precio: Decimal
+    precio_min: Optional[Decimal] = None
+    precio_max: Optional[Decimal] = None
+    presentacion: Optional[str] = None
+
+    class Config:
+        from_attributes = True
+
+
+class ChoclosResumen(BaseModel):
+    precio: Decimal
+    precio_min: Optional[Decimal] = None
+    precio_max: Optional[Decimal] = None
+    unidad: Optional[str] = None
+    fecha: datetime
+    fuente: str
+    variedades: Optional[str] = None
+    tendencia: str  # 'sube' | 'baja' | 'estable'
+    variacion_abs: Optional[Decimal] = None
+    variacion_pct: Optional[Decimal] = None
+
+
+class MaizDuroResumen(BaseModel):
+    precio_promedio: Decimal
+    precio_min: Decimal
+    precio_max: Decimal
+    unidad: str
+    fuente: str
+    temporada: str
+    actualizado: datetime
+
+
+class MercadoResumen(BaseModel):
+    choclo: Optional[ChoclosResumen] = None
+    maiz_duro: Optional[MaizDuroResumen] = None
