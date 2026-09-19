@@ -161,6 +161,7 @@ def generate_xai(
     # Obtener predicción y liberar logits antes de GradCAM (ahorra ~150 MB en RAM limitada)
     with torch.no_grad():
         logits = model(tensor)
+        probs = torch.softmax(logits, dim=1).squeeze(0).cpu().numpy()  # (num_classes, H, W)
         preds = logits.argmax(dim=1).squeeze(0).cpu().numpy().astype(np.uint8)
     del logits
     gc.collect()
@@ -219,14 +220,24 @@ def generate_xai(
         buffer.seek(0)
         encoded = base64.b64encode(buffer.read()).decode("utf-8")
         
-        # Confianza = proporción de píxeles para la clase objetivo
-        confidence = float((preds == target_class_idx).sum()) / preds.size * 100
-        
+        # Área afectada = proporción de píxeles de la imagen clasificados como la clase objetivo
+        # (no es una métrica de confianza del modelo, es cobertura/extensión del síntoma).
+        affected_area_pct = float((preds == target_class_idx).sum()) / preds.size * 100
+
+        # Confianza del modelo = probabilidad softmax promedio que el modelo asignó a la
+        # clase ganadora, sobre los píxeles que él mismo clasificó como esa clase.
+        pixel_mask = preds == target_class_idx
+        if pixel_mask.any():
+            model_confidence = float(probs[target_class_idx][pixel_mask].mean()) * 100
+        else:
+            model_confidence = float(probs[target_class_idx].mean()) * 100
+
         return {
             "xai_base64_png": encoded,
             "target_class": target_class_name,
             "target_class_id": int(target_class_idx),
-            "confidence": round(confidence, 2),
+            "confidence": round(affected_area_pct, 2),
+            "model_confidence": round(model_confidence, 2),
             "all_classes": CFG.class_names,
         }
     
