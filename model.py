@@ -27,10 +27,10 @@ class CFG:
     img_size: int = 384
     num_classes: int = 4
     class_names: List[str] = [
-        "Fondo_y_Sana",
+        "Fondo",
         "Tizon",
         "Roya",
-        "Mancha_Blanca",
+        "Mancha_blanca",
     ]
     device: torch.device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
