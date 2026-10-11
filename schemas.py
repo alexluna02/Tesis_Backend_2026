@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Optional
+from typing import Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
@@ -150,3 +150,15 @@ class MaizDuroResumen(BaseModel):
 class MercadoResumen(BaseModel):
     choclo: Optional[ChoclosResumen] = None
     maiz_duro: Optional[MaizDuroResumen] = None
+
+
+AssignableRole = Literal["agricultor", "investigador"]
+
+
+class AdminUserCreate(UserCreate):
+    rol: AssignableRole = "agricultor"
+
+
+class AdminUserUpdate(BaseModel):
+    rol: Optional[AssignableRole] = None
+    activo: Optional[bool] = None

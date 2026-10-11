@@ -39,6 +39,7 @@ engine = create_async_engine(
 async_session = async_sessionmaker(bind=engine, expire_on_commit=False, class_=AsyncSession)
 
 rol_usuario_enum = ENUM(
+    "agricultor",
     "investigador",
     "director",
     "admin",
@@ -83,7 +84,7 @@ class Usuario(Base):
     rol: Mapped[str] = mapped_column(
         rol_usuario_enum,
         nullable=False,
-        server_default=text("'investigador'::rol_usuario"),
+        server_default=text("'agricultor'::rol_usuario"),
     )
     activo: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
     created_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False, server_default=func.now())

@@ -8,6 +8,7 @@ from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
 from typing import List
+from uuid import UUID
 
 import httpx
 from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
@@ -133,7 +134,7 @@ async def startup_event():
             await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
             await conn.execute(text("""
                 DO $$ BEGIN
-                    CREATE TYPE rol_usuario AS ENUM ('investigador', 'director', 'admin');
+                    CREATE TYPE rol_usuario AS ENUM ('agricultor', 'investigador', 'director', 'admin');
                 EXCEPTION WHEN duplicate_object THEN null; END $$
             """))
             await conn.execute(text("""
@@ -142,6 +143,12 @@ async def startup_event():
                 EXCEPTION WHEN duplicate_object THEN null; END $$
             """))
             await conn.run_sync(database.Base.metadata.create_all)
+        # 'agricultor' was added after the enum was first created; the new value
+        # must be committed before it can be used as the column default.
+        async with database.engine.begin() as conn:
+            await conn.execute(text("ALTER TYPE rol_usuario ADD VALUE IF NOT EXISTS 'agricultor'"))
+        async with database.engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE usuarios ALTER COLUMN rol SET DEFAULT 'agricultor'"))
         print("[startup] Schema listo")
     except Exception as exc:
         print(f"[startup] Error creando schema: {exc}")
@@ -208,6 +215,7 @@ async def register_user(user_create: schemas.UserCreate, db: AsyncSession = Depe
         nombre=user_create.nombre,
         email=user_create.email,
         password_hash=auth.get_password_hash(user_create.password),
+        rol="agricultor",
     )
     db.add(user)
     await db.commit()
@@ -277,6 +285,7 @@ async def login_with_google(request: schemas.GoogleLoginRequest, db: AsyncSessio
             nombre=nombre,
             email=email,
             password_hash=auth.get_password_hash(secrets.token_urlsafe(32)),
+            rol="agricultor",
         )
         db.add(user)
         await db.commit()
@@ -330,6 +339,68 @@ async def change_password(
     current_user.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
     return {"detail": "Contraseña actualizada correctamente"}
+
+
+# ── Admin: gestión de usuarios ────────────────────────────────────────────────
+# La cuenta admin es única: desde aquí solo se asignan los roles agricultor e
+# investigador, y el admin no puede modificarse a sí mismo ni a otro admin.
+
+async def _get_managed_user(db: AsyncSession, user_id: UUID, admin: database.Usuario) -> database.Usuario:
+    user = await db.get(database.Usuario, user_id)
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Usuario no encontrado")
+    if user.id == admin.id or user.rol == "admin":
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="No se puede modificar una cuenta de administrador")
+    return user
+
+
+@app.get("/admin/users", response_model=List[schemas.UserRead], tags=["admin"])
+async def admin_list_users(
+    _: database.Usuario = Depends(auth.get_current_active_admin),
+    db: AsyncSession = Depends(database.get_db),
+):
+    result = await db.execute(select(database.Usuario).order_by(database.Usuario.created_at.desc()))
+    return result.scalars().all()
+
+
+@app.post("/admin/users", response_model=schemas.UserRead, tags=["admin"], status_code=status.HTTP_201_CREATED)
+async def admin_create_user(
+    req: schemas.AdminUserCreate,
+    _: database.Usuario = Depends(auth.get_current_active_admin),
+    db: AsyncSession = Depends(database.get_db),
+):
+    result = await db.execute(select(database.Usuario).where(database.Usuario.email == req.email))
+    if result.scalars().first():
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="El correo ya está registrado")
+
+    user = database.Usuario(
+        nombre=req.nombre.strip(),
+        email=req.email,
+        password_hash=auth.get_password_hash(req.password),
+        rol=req.rol,
+    )
+    db.add(user)
+    await db.commit()
+    await db.refresh(user)
+    return user
+
+
+@app.patch("/admin/users/{user_id}", response_model=schemas.UserRead, tags=["admin"])
+async def admin_update_user(
+    user_id: UUID,
+    req: schemas.AdminUserUpdate,
+    admin: database.Usuario = Depends(auth.get_current_active_admin),
+    db: AsyncSession = Depends(database.get_db),
+):
+    user = await _get_managed_user(db, user_id, admin)
+    if req.rol is not None:
+        user.rol = req.rol
+    if req.activo is not None:
+        user.activo = req.activo
+    user.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
+    await db.commit()
+    await db.refresh(user)
+    return user
 
 
 @app.post("/auth/forgot-password", tags=["auth"])
