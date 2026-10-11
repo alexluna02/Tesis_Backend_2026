@@ -24,7 +24,7 @@ print(f"[model.py] XAI_AVAILABLE={XAI_AVAILABLE}, GRADCAM_ERROR={GRADCAM_ERROR}"
 
 
 class CFG:
-    img_size: int = 768
+    img_size: int = 384
     num_classes: int = 4
     class_names: List[str] = [
         "Fondo_y_Sana",
