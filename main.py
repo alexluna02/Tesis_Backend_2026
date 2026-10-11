@@ -3,6 +3,7 @@ import os
 import random
 import secrets
 import smtplib
+import time
 from datetime import datetime, timedelta, timezone
 from email.mime.multipart import MIMEMultipart
 from email.mime.text import MIMEText
@@ -118,6 +119,7 @@ app.add_middleware(
 
 MODEL_PATH = os.environ.get("MODEL_PATH", "Mit_B0_384_Test.pth")
 model = None
+MODEL_LOAD_TIME_MS: float | None = None
 
 
 @app.on_event("startup")
@@ -145,8 +147,12 @@ async def startup_event():
         print(f"[startup] Error creando schema: {exc}")
 
     # ── Load ML model ─────────────────────────────────────────────────────────
+    global MODEL_LOAD_TIME_MS
     try:
+        _t0 = time.perf_counter()
         model = load_model(MODEL_PATH, device=CFG.device)
+        MODEL_LOAD_TIME_MS = round((time.perf_counter() - _t0) * 1000, 1)
+        print(f"[startup] Modelo cargado en {MODEL_LOAD_TIME_MS} ms")
     except FileNotFoundError:
         model = None
         print(f"[startup] Modelo no encontrado en {MODEL_PATH}")
@@ -186,6 +192,7 @@ async def health_check(db: AsyncSession = Depends(database.get_db)):
         "device": str(CFG.device),
         "model_loaded": model is not None,
         "model_path": MODEL_PATH,
+        "model_load_time_ms": MODEL_LOAD_TIME_MS,
         "database_ready": db_ready,
     }
 
@@ -494,9 +501,16 @@ async def predict_segmentation(
     if model is None:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail="Modelo no está cargado")
 
+    t_request = time.perf_counter()
     try:
         content = await file.read()
+        t_inference = time.perf_counter()
         result = predict_from_bytes(model, content)
+        inference_ms = round((time.perf_counter() - t_inference) * 1000, 1)
+        result["timing"] = {
+            "inference_time_ms": inference_ms,
+            "api_response_time_ms": round((time.perf_counter() - t_request) * 1000, 1),
+        }
         return result
     except Exception as exc:
         raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc))
@@ -513,11 +527,18 @@ async def predict_xai(
     if not XAI_AVAILABLE:
         raise HTTPException(status_code=status.HTTP_503_SERVICE_UNAVAILABLE, detail=GRADCAM_ERROR or "XAI no está disponible")
 
+    t_request = time.perf_counter()
     try:
         content = await file.read()
+        t_inference = time.perf_counter()
         result = generate_xai(model, content, target_class=target_class)
         if "error" in result:
             raise HTTPException(status_code=status.HTTP_500_INTERNAL_SERVER_ERROR, detail=result["error"])
+        inference_ms = round((time.perf_counter() - t_inference) * 1000, 1)
+        result["timing"] = {
+            "inference_time_ms": inference_ms,
+            "api_response_time_ms": round((time.perf_counter() - t_request) * 1000, 1),
+        }
         return result
     except HTTPException:
         raise
