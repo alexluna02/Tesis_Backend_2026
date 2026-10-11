@@ -10,7 +10,7 @@ albumentations
 timm
 pillow
 pdfplumber
-sqlalchemy
+sqlalchemy[asyncio]
 asyncpg
 bcrypt
 python-jose[cryptography]
