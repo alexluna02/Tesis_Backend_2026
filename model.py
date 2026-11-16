@@ -222,7 +222,8 @@ def generate_xai(
         
         # Área afectada = proporción de píxeles de la imagen clasificados como la clase objetivo
         # (no es una métrica de confianza del modelo, es cobertura/extensión del síntoma).
-        affected_area_pct = float((preds == target_class_idx).sum()) / preds.size * 100
+        # Una imagen sin enfermedad tiene 0 %: el fondo no cuenta como área afectada.
+        affected_area_pct = 0.0 if target_class_idx == 0 else float((preds == target_class_idx).sum()) / preds.size * 100
 
         # Confianza del modelo = probabilidad softmax promedio que el modelo asignó a la
         # clase ganadora, sobre los píxeles que él mismo clasificó como esa clase.
