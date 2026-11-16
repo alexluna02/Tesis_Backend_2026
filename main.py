@@ -1,6 +1,7 @@
 import asyncio
+import hashlib
+import hmac
 import os
-import random
 import secrets
 import smtplib
 import time
@@ -11,9 +12,9 @@ from typing import List
 from uuid import UUID
 
 import httpx
-from fastapi import Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile, status
 from fastapi.middleware.cors import CORSMiddleware
-from sqlalchemy import select, text
+from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
@@ -30,6 +31,10 @@ SMTP_USER     = os.getenv("SMTP_USER", "")
 SMTP_PASSWORD = os.getenv("SMTP_PASSWORD", "")
 
 RESET_CODE_EXPIRE_MINUTES = 15
+RESET_CODE_MAX_ATTEMPTS = 5
+RESET_CODE_RESEND_SECONDS = 60
+FORGOT_PASSWORD_MSG = "Si el correo está registrado, recibirás un código de verificación."
+RESET_CODE_EXPIRED_MSG = "El código expiró o superó el número de intentos. Solicita uno nuevo."
 
 
 def _build_reset_email_html(code: str) -> str:
@@ -79,29 +84,71 @@ async def send_reset_email(to: str, code: str) -> None:
     await asyncio.to_thread(_send_email_sync, to, "Código de recuperación - AgroScan", html)
 
 
-def create_reset_token(email: str, code: str) -> str:
-    payload = {
-        "sub":     email,
-        "code":    code,
-        "purpose": "reset",
-        "exp":     datetime.utcnow() + timedelta(minutes=RESET_CODE_EXPIRE_MINUTES),
-    }
-    return auth.jwt.encode(payload, auth.SECRET_KEY, algorithm=auth.ALGORITHM)
+def _utcnow() -> datetime:
+    return datetime.now(timezone.utc).replace(tzinfo=None)
 
 
-def verify_reset_token(token: str, code: str) -> str:
+def _hash_reset_code(user_id, code: str) -> str:
+    # HMAC con la clave del servidor: aunque se filtrara la tabla, los 10^6 códigos
+    # posibles no se pueden probar sin conocer JWT_SECRET_KEY.
+    return hmac.new(auth.SECRET_KEY.encode(), f"{user_id}:{code}".encode(), hashlib.sha256).hexdigest()
+
+
+async def _send_reset_email_safe(to: str, code: str) -> None:
     try:
-        from jose import JWTError, jwt as _jwt
-        payload = _jwt.decode(token, auth.SECRET_KEY, algorithms=[auth.ALGORITHM])
-        if payload.get("purpose") != "reset":
-            raise HTTPException(status_code=400, detail="Token inválido")
-        if payload.get("code") != code:
-            raise HTTPException(status_code=400, detail="Código incorrecto")
-        return payload["sub"]
+        await send_reset_email(to, code)
     except Exception as exc:
-        if isinstance(exc, HTTPException):
-            raise
-        raise HTTPException(status_code=400, detail="Token inválido o expirado")
+        print(f"[AgroScan] Error enviando el código de recuperación a {to}: {exc}")
+
+
+async def _check_reset_code(db: AsyncSession, email: str, code: str) -> tuple[database.Usuario, UUID]:
+    """Valida el código vigente del usuario gastando un intento.
+
+    El intento se descuenta con un UPDATE condicional (atómico en PostgreSQL), así que
+    ni enviando cientos de peticiones en paralelo se superan RESET_CODE_MAX_ATTEMPTS.
+    """
+    result = await db.execute(select(database.Usuario).where(database.Usuario.email == email))
+    user = result.scalars().first()
+    if user is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=RESET_CODE_EXPIRED_MSG)
+
+    reset_id = (await db.execute(
+        select(database.PasswordReset.id)
+        .where(
+            database.PasswordReset.user_id == user.id,
+            database.PasswordReset.usado.is_(False),
+            database.PasswordReset.expires_at > _utcnow(),
+        )
+        .order_by(database.PasswordReset.created_at.desc())
+        .limit(1)
+    )).scalar()
+    if reset_id is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=RESET_CODE_EXPIRED_MSG)
+
+    reserved = (await db.execute(
+        update(database.PasswordReset)
+        .where(
+            database.PasswordReset.id == reset_id,
+            database.PasswordReset.usado.is_(False),
+            database.PasswordReset.intentos < RESET_CODE_MAX_ATTEMPTS,
+        )
+        .values(intentos=database.PasswordReset.intentos + 1)
+        .returning(database.PasswordReset.code_hash, database.PasswordReset.intentos)
+        .execution_options(synchronize_session=False)
+    )).first()
+    await db.commit()
+
+    if reserved is None:
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=RESET_CODE_EXPIRED_MSG)
+    if not hmac.compare_digest(reserved.code_hash, _hash_reset_code(user.id, code)):
+        restantes = RESET_CODE_MAX_ATTEMPTS - reserved.intentos
+        if restantes <= 0:
+            raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail=RESET_CODE_EXPIRED_MSG)
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Código incorrecto. Te queda{'n' if restantes > 1 else ''} {restantes} intento{'s' if restantes > 1 else ''}.",
+        )
+    return user, reset_id
 
 
 app = FastAPI(
@@ -126,6 +173,10 @@ MODEL_LOAD_TIME_MS: float | None = None
 @app.on_event("startup")
 async def startup_event():
     global model
+
+    if auth.SECRET_KEY == auth.DEFAULT_SECRET_KEY:
+        print("[startup] ADVERTENCIA: JWT_SECRET_KEY no está configurada. Se usa una clave por defecto "
+              "pública y cualquiera podría firmar tokens válidos. Configúrala en los secrets del despliegue.")
 
     # ── Auto-create schema (idempotent — safe to run every startup) ──────────
     # Required the first time the app connects to a fresh cloud DB (e.g. Render).
@@ -406,24 +457,62 @@ async def admin_update_user(
 @app.post("/auth/forgot-password", tags=["auth"])
 async def forgot_password(
     request: schemas.ForgotPasswordRequest,
+    background_tasks: BackgroundTasks,
     db: AsyncSession = Depends(database.get_db),
 ):
+    # Siempre la misma respuesta, y el correo se envía en segundo plano para que ni el
+    # contenido ni el tiempo de respuesta revelen si la cuenta existe.
     result = await db.execute(select(database.Usuario).where(database.Usuario.email == request.email))
     user = result.scalars().first()
+    if user is None or not user.activo:
+        return {"detail": FORGOT_PASSWORD_MSG}
 
-    # Respuesta genérica aunque el correo no exista (evita enumeración de usuarios)
-    if user is None:
-        return {"detail": "Si el correo existe, recibirás un código de verificación."}
+    now = _utcnow()
+    ultimo_envio = (await db.execute(
+        select(database.PasswordReset.created_at)
+        .where(database.PasswordReset.user_id == user.id)
+        .order_by(database.PasswordReset.created_at.desc())
+        .limit(1)
+    )).scalar()
+    if ultimo_envio is not None and (now - ultimo_envio).total_seconds() < RESET_CODE_RESEND_SECONDS:
+        return {"detail": FORGOT_PASSWORD_MSG}
 
-    code        = str(random.randint(100000, 999999))
-    reset_token = create_reset_token(user.email, code)
+    # Un solo código vigente por usuario: pedir uno nuevo anula los anteriores
+    await db.execute(
+        update(database.PasswordReset)
+        .where(database.PasswordReset.user_id == user.id, database.PasswordReset.usado.is_(False))
+        .values(usado=True)
+        .execution_options(synchronize_session=False)
+    )
+    code = f"{secrets.randbelow(1_000_000):06d}"
+    db.add(database.PasswordReset(
+        user_id=user.id,
+        code_hash=_hash_reset_code(user.id, code),
+        expires_at=now + timedelta(minutes=RESET_CODE_EXPIRE_MINUTES),
+        created_at=now,
+    ))
+    await db.commit()
 
-    try:
-        await send_reset_email(user.email, code)
-    except Exception as exc:
-        print(f"[AgroScan] Error enviando email: {exc}. Código: {code}")
+    background_tasks.add_task(_send_reset_email_safe, user.email, code)
+    return {"detail": FORGOT_PASSWORD_MSG}
 
-    return {"reset_token": reset_token, "detail": "Código enviado. Revisa tu bandeja de entrada."}
+
+@app.post("/auth/verify-reset-code", tags=["auth"])
+async def verify_reset_code(
+    request: schemas.ResetCodeRequest,
+    db: AsyncSession = Depends(database.get_db),
+):
+    """Comprueba el código sin cambiar la contraseña (paso 2 del asistente de recuperación)."""
+    _, reset_id = await _check_reset_code(db, request.email, request.code)
+    # Un código correcto no gasta intento: debe seguir sirviendo en el paso final
+    await db.execute(
+        update(database.PasswordReset)
+        .where(database.PasswordReset.id == reset_id)
+        .values(intentos=database.PasswordReset.intentos - 1)
+        .execution_options(synchronize_session=False)
+    )
+    await db.commit()
+    return {"detail": "Código verificado."}
 
 
 @app.post("/auth/reset-password", tags=["auth"])
@@ -431,15 +520,18 @@ async def reset_password(
     request: schemas.ResetPasswordRequest,
     db: AsyncSession = Depends(database.get_db),
 ):
-    email = verify_reset_token(request.reset_token, request.code)
+    user, reset_id = await _check_reset_code(db, request.email, request.code)
 
-    result = await db.execute(select(database.Usuario).where(database.Usuario.email == email))
-    user = result.scalars().first()
-    if user is None:
-        raise HTTPException(status_code=404, detail="Usuario no encontrado")
-
+    await db.execute(
+        update(database.PasswordReset)
+        .where(database.PasswordReset.id == reset_id)
+        .values(usado=True)
+        .execution_options(synchronize_session=False)
+    )
     user.password_hash = auth.get_password_hash(request.new_password)
-    user.updated_at    = datetime.now(timezone.utc).replace(tzinfo=None)
+    user.updated_at = _utcnow()
+    # Cierra todas las sesiones abiertas: si alguien más tenía acceso a la cuenta, lo pierde
+    await auth.revoke_all_refresh_tokens(db, user.id)
     await db.commit()
     return {"detail": "Contraseña actualizada correctamente. Ya puedes iniciar sesión."}
 

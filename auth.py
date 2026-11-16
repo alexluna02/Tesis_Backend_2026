@@ -13,7 +13,8 @@ from sqlalchemy.ext.asyncio import AsyncSession
 import database
 import schemas
 
-SECRET_KEY = os.getenv("JWT_SECRET_KEY", "cambia_esta_llave_secreta")
+DEFAULT_SECRET_KEY = "cambia_esta_llave_secreta"
+SECRET_KEY = os.getenv("JWT_SECRET_KEY", DEFAULT_SECRET_KEY)
 ALGORITHM = os.getenv("JWT_ALGORITHM", "HS256")
 ACCESS_TOKEN_EXPIRE_MINUTES = int(os.getenv("ACCESS_TOKEN_EXPIRE_MINUTES", "15"))
 REFRESH_TOKEN_EXPIRE_DAYS = int(os.getenv("REFRESH_TOKEN_EXPIRE_DAYS", "30"))
@@ -88,35 +89,46 @@ async def get_current_active_admin(current_user: database.Usuario = Depends(get_
 
 
 async def rotate_refresh_token(db: AsyncSession, current_token: str) -> tuple[database.Usuario, str]:
-    result = await db.execute(
-        select(database.RefreshToken)
+    # Revocación atómica: si llegan dos peticiones con el mismo token, solo una lo rota.
+    revoked = (await db.execute(
+        update(database.RefreshToken)
         .where(
             database.RefreshToken.token == current_token,
-            database.RefreshToken.revocado == False,
+            database.RefreshToken.revocado.is_(False),
             database.RefreshToken.expires_at > datetime.utcnow(),
         )
-    )
-    token_row = result.scalars().first()
-    if token_row is None:
+        .values(revocado=True)
+        .returning(database.RefreshToken.user_id)
+        .execution_options(synchronize_session=False)
+    )).first()
+    if revoked is None:
         raise HTTPException(status_code=status.HTTP_401_UNAUTHORIZED, detail="Refresh token inválido o expirado")
 
-    user = token_row.user
-    token_row.revocado = True
-    await db.execute(
-        update(database.RefreshToken)
-        .where(database.RefreshToken.id == token_row.id)
-        .values(revocado=True)
-    )
+    # Carga explícita del usuario: acceder a la relación lazy `token_row.user` en una
+    # sesión async lanza MissingGreenlet y hacía fallar siempre este endpoint.
+    user = await db.get(database.Usuario, revoked.user_id)
+    if user is None or not user.activo:
+        await db.commit()
+        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Usuario desactivado")
 
     new_refresh_token = create_refresh_token()
-    new_token = database.RefreshToken(
-        user_id=token_row.user_id,
+    db.add(database.RefreshToken(
+        user_id=user.id,
         token=new_refresh_token,
         expires_at=datetime.utcnow() + timedelta(days=REFRESH_TOKEN_EXPIRE_DAYS),
-    )
-    db.add(new_token)
+    ))
     await db.commit()
     return user, new_refresh_token
+
+
+async def revoke_all_refresh_tokens(db: AsyncSession, user_id) -> None:
+    """Cierra todas las sesiones del usuario (no hace commit: lo hace quien llama)."""
+    await db.execute(
+        update(database.RefreshToken)
+        .where(database.RefreshToken.user_id == user_id, database.RefreshToken.revocado.is_(False))
+        .values(revocado=True)
+        .execution_options(synchronize_session=False)
+    )
 
 
 async def revoke_refresh_token(db: AsyncSession, refresh_token: str) -> None:

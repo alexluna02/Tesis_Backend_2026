@@ -115,6 +115,27 @@ class RefreshToken(Base):
     user: Mapped[Usuario] = relationship("Usuario", back_populates="refresh_tokens")
 
 
+class PasswordReset(Base):
+    """Código de recuperación de contraseña.
+
+    Solo se guarda un HMAC del código: el código en claro viaja únicamente por correo
+    y nunca se devuelve al navegador.
+    """
+    __tablename__ = "password_resets"
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("uuid_generate_v4()"),
+    )
+    user_id: Mapped[str] = mapped_column(ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False, index=True)
+    code_hash: Mapped[str] = mapped_column(String(64), nullable=False)
+    expires_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False)
+    intentos: Mapped[int] = mapped_column(SmallInteger, nullable=False, server_default=text("0"))
+    usado: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("FALSE"))
+    created_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False, server_default=func.now())
+
+
 class Analisis(Base):
     __tablename__ = "analisis"
 
