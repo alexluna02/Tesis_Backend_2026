@@ -200,6 +200,9 @@ async def startup_event():
             await conn.execute(text("ALTER TYPE rol_usuario ADD VALUE IF NOT EXISTS 'agricultor'"))
         async with database.engine.begin() as conn:
             await conn.execute(text("ALTER TABLE usuarios ALTER COLUMN rol SET DEFAULT 'agricultor'"))
+        # Columna añadida después de crear la tabla: create_all no altera tablas existentes
+        async with database.engine.begin() as conn:
+            await conn.execute(text("ALTER TABLE analisis ADD COLUMN IF NOT EXISTS resultado_url TEXT"))
         print("[startup] Schema listo")
     except Exception as exc:
         print(f"[startup] Error creando schema: {exc}")
@@ -558,6 +561,7 @@ async def create_analysis(
         enfermedad_id=enfermedad.id,
         imagen_url=payload.imagen_url,
         grad_cam_url=payload.grad_cam_url,
+        resultado_url=payload.resultado_url,
         afectacion_pct=payload.afectacion_pct,
         severidad=payload.severidad,
     )

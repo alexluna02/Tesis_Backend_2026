@@ -148,6 +148,8 @@ class Analisis(Base):
     enfermedad_id: Mapped[int] = mapped_column(ForeignKey("enfermedades.id"), nullable=False)
     imagen_url: Mapped[str] = mapped_column(Text, nullable=False)
     grad_cam_url: Mapped[str] = mapped_column(Text, nullable=True)
+    # Imagen de salida tal como se mostró al analizar (original + área afectada + caja + etiqueta)
+    resultado_url: Mapped[str] = mapped_column(Text, nullable=True)
     afectacion_pct: Mapped[float] = mapped_column(Numeric(5, 2), nullable=False)
     severidad: Mapped[str] = mapped_column(nivel_severidad_enum, nullable=False)
     fecha: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False, server_default=func.now())

@@ -91,6 +91,7 @@ class EnfermedadRead(BaseModel):
 class AnalisisCreate(BaseModel):
     imagen_url: str
     grad_cam_url: Optional[str] = None
+    resultado_url: Optional[str] = None
     afectacion_pct: Decimal
     severidad: str = Field(..., example="moderada")
     enfermedad_id: int
@@ -100,6 +101,7 @@ class AnalisisRead(BaseModel):
     id: UUID
     imagen_url: str
     grad_cam_url: Optional[str] = None
+    resultado_url: Optional[str] = None
     afectacion_pct: Decimal
     severidad: str
     fecha: datetime
