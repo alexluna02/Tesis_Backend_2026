@@ -225,14 +225,14 @@ async def startup_event():
     except Exception as exc:
         print(f"[startup] Error inicializando la base de datos: {exc}")
 
-    # ── Seed market prices (choclo diario + banda oficial de maíz duro) ──────
+    # ── Precios de mercado: banda oficial de maíz duro y, en segundo plano para no retrasar
+    #    el arranque, los boletines diarios de los últimos 120 días (10 productos) ──────────
     try:
         async with database.async_session() as session:
             await mercado.ensure_maiz_duro_seed(session)
-            insertados = await mercado.sync_choclo_prices(session)
-            print(f"[startup] Precios de choclo sincronizados: {insertados} día(s) nuevo(s)")
     except Exception as exc:
-        print(f"[startup] Error sincronizando precios de mercado: {exc}")
+        print(f"[startup] Error preparando precios de mercado: {exc}")
+    mercado.iniciar_sincronizacion_inicial(dias=120)
 
 
 @app.get("/", tags=["general"])
@@ -633,14 +633,26 @@ async def get_stats(current_user: database.Usuario = Depends(auth.get_current_ac
     )
 
 
+async def _sincronizar_mercado(db: AsyncSession, dias: int = 3) -> None:
+    """Trae los boletines recientes que falten; si falla, la página usa lo que ya está guardado."""
+    try:
+        await mercado.sync_mercado(db, days_back=dias)
+    except Exception as exc:
+        await db.rollback()
+        print(f"[mercado] Error sincronizando precios: {exc}")
+
+
 @app.get("/mercado/resumen", response_model=schemas.MercadoResumen, tags=["mercado"])
 async def get_mercado_resumen(db: AsyncSession = Depends(database.get_db)):
-    try:
-        await mercado.sync_choclo_prices(db, days_back=3)
-    except Exception as exc:
-        print(f"[mercado] Error sincronizando precios: {exc}")
-    resumen = await mercado.get_resumen(db)
-    return resumen
+    await _sincronizar_mercado(db)
+    return await mercado.get_resumen(db)
+
+
+@app.get("/mercado/productos", response_model=schemas.MercadoProductos, tags=["mercado"])
+async def get_mercado_productos(dias: int = 90, db: AsyncSession = Depends(database.get_db)):
+    """Los 10 productos de AgroScan con su último precio, la variación semanal y la serie de «dias»."""
+    await _sincronizar_mercado(db)
+    return await mercado.get_productos(db, dias)
 
 
 @app.get("/mercado/historico", response_model=List[schemas.PrecioPunto], tags=["mercado"])
@@ -649,14 +661,14 @@ async def get_mercado_historico(
     dias: int = 30,
     db: AsyncSession = Depends(database.get_db),
 ):
-    if producto not in ("choclo", "maiz_duro"):
-        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Producto inválido. Use 'choclo' o 'maiz_duro'.")
+    if producto != "maiz_duro" and producto not in mercado.CLAVES:
+        raise HTTPException(
+            status_code=status.HTTP_400_BAD_REQUEST,
+            detail=f"Producto inválido. Use 'maiz_duro' o uno de: {', '.join(mercado.CLAVES)}.",
+        )
     dias = max(1, min(dias, 365))
-    if producto == "choclo":
-        try:
-            await mercado.sync_choclo_prices(db, days_back=3)
-        except Exception as exc:
-            print(f"[mercado] Error sincronizando precios: {exc}")
+    if producto != "maiz_duro":
+        await _sincronizar_mercado(db)
     return await mercado.get_historico(db, producto, dias)
 
 

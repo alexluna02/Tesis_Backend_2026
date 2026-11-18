@@ -1,6 +1,6 @@
 from datetime import datetime
 from decimal import Decimal
-from typing import Literal, Optional
+from typing import List, Literal, Optional
 from uuid import UUID
 
 from pydantic import BaseModel, EmailStr, Field
@@ -154,6 +154,56 @@ class MaizDuroResumen(BaseModel):
 
 class MercadoResumen(BaseModel):
     choclo: Optional[ChoclosResumen] = None
+    maiz_duro: Optional[MaizDuroResumen] = None
+
+
+class SeriePrecio(BaseModel):
+    fecha: datetime
+    precio: Decimal
+    precio_min: Optional[Decimal] = None
+    precio_max: Optional[Decimal] = None
+
+
+class SeriePunto(BaseModel):
+    fecha: datetime
+    precio: Decimal
+
+
+class VariedadMercado(BaseModel):
+    nombre: str
+    precio: Decimal
+    fecha: datetime
+    precio_semana_anterior: Optional[Decimal] = None
+    fecha_semana_anterior: Optional[datetime] = None
+    variacion_semanal: Optional[Decimal] = None
+    variacion_semanal_pct: Optional[Decimal] = None
+    tendencia: str
+    serie: List[SeriePunto] = []
+
+
+class ProductoMercado(BaseModel):
+    producto: str
+    nombre: str
+    unidad: Optional[str] = None
+    precio: Decimal
+    precio_min: Optional[Decimal] = None
+    precio_max: Optional[Decimal] = None
+    fecha: datetime
+    variedades: Optional[str] = None
+    precio_semana_anterior: Optional[Decimal] = None
+    fecha_semana_anterior: Optional[datetime] = None
+    variacion_semanal: Optional[Decimal] = None
+    variacion_semanal_pct: Optional[Decimal] = None
+    tendencia: str  # 'sube' | 'baja' | 'estable' (frente a la semana anterior)
+    serie: List[SeriePrecio] = []
+    variedades_detalle: List[VariedadMercado] = []  # cada variedad por separado (si hay 2 o más)
+
+
+class MercadoProductos(BaseModel):
+    fuente: str
+    fuente_url: str
+    actualizado: Optional[datetime] = None
+    productos: List[ProductoMercado] = []
     maiz_duro: Optional[MaizDuroResumen] = None
 
 
