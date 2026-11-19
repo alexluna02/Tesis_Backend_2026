@@ -5,9 +5,9 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from sqlalchemy import (Boolean, Column, DateTime, ForeignKey, Integer, SmallInteger,
+from sqlalchemy import (Boolean, CheckConstraint, Column, DateTime, ForeignKey, Index, Integer, SmallInteger,
                         String, Text, UniqueConstraint, func, text, Numeric)
-from sqlalchemy.dialects.postgresql import UUID, ENUM
+from sqlalchemy.dialects.postgresql import JSONB, UUID, ENUM
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
 
@@ -43,6 +43,7 @@ rol_usuario_enum = ENUM(
     "investigador",
     "director",
     "admin",
+    "experto",
     name="rol_usuario",
     create_type=False,
 )
@@ -177,6 +178,88 @@ class PrecioMercado(Base):
     fecha: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False)
     created_at: Mapped[str] = mapped_column(DateTime(timezone=False), server_default=func.now())
 
+
+
+class Consulta(Base):
+    """Consulta de un usuario (normalmente un agricultor) a un experto sobre uno de sus análisis.
+
+    `resumen` guarda una foto del análisis al enviarlo: los análisis por parcela viven en el navegador
+    y el análisis individual puede borrarse después (entonces `analisis_id` pasa a NULL).
+    Todas las marcas de tiempo se escriben desde Python en UTC naive para poder compararlas entre sí.
+    """
+    __tablename__ = "consultas"
+    __table_args__ = (
+        CheckConstraint("tipo IN ('individual', 'parcela')", name="ck_consulta_tipo"),
+        CheckConstraint("estado IN ('abierta', 'cerrada')", name="ck_consulta_estado"),
+        CheckConstraint("solicitante_id <> experto_id", name="ck_consulta_participantes"),
+        CheckConstraint(
+            "dictamen_diagnostico IS NULL OR dictamen_diagnostico IN ('Fondo', 'Tizon', 'Roya', 'Mancha_blanca', 'Otro')",
+            name="ck_consulta_dictamen_diagnostico",
+        ),
+        Index("ix_consultas_solicitante_actividad", "solicitante_id", "ultimo_mensaje_at"),
+        Index("ix_consultas_experto_actividad", "experto_id", "ultimo_mensaje_at"),
+        # Una sola consulta abierta por análisis (o visita de parcela) y experto: evita duplicados por doble clic
+        Index(
+            "uq_consulta_abierta_analisis", "solicitante_id", "experto_id", "analisis_id", unique=True,
+            postgresql_where=text("estado = 'abierta' AND analisis_id IS NOT NULL"),
+        ),
+        Index(
+            "uq_consulta_abierta_referencia", "solicitante_id", "experto_id", "referencia", unique=True,
+            postgresql_where=text("estado = 'abierta' AND referencia IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("uuid_generate_v4()"),
+    )
+    solicitante_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False)
+    experto_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False)
+    tipo: Mapped[str] = mapped_column(String(20), nullable=False)  # 'individual' | 'parcela'
+    # Si el dueño borra el análisis, la consulta se conserva con su resumen
+    analisis_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("analisis.id", ondelete="SET NULL"), nullable=True)
+    # Identificador de la visita de parcela en el navegador (para no enviar dos veces la misma)
+    referencia: Mapped[str] = mapped_column(String(100), nullable=True)
+    resumen: Mapped[dict] = mapped_column(JSONB, nullable=False)
+    estado: Mapped[str] = mapped_column(String(20), nullable=False, server_default=text("'abierta'"))
+    # Dictamen del experto: su propio diagnóstico, independiente del modelo
+    dictamen_coincide: Mapped[bool] = mapped_column(Boolean, nullable=True)
+    dictamen_diagnostico: Mapped[str] = mapped_column(String(30), nullable=True)
+    dictamen_texto: Mapped[str] = mapped_column(Text, nullable=True)
+    dictamen_fecha: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=True)
+    # Última vez que cada participante leyó la conversación (NULL en el experto = consulta nueva sin abrir)
+    leido_solicitante_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=True)
+    leido_experto_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=True)
+    ultimo_mensaje_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False)
+    created_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False)
+    cerrada_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=True)
+
+
+class MensajeConsulta(Base):
+    """Mensaje del chat de una consulta: texto, imagen (data URL) o ambos."""
+    __tablename__ = "mensajes_consulta"
+    __table_args__ = (
+        CheckConstraint("texto IS NOT NULL OR imagen_url IS NOT NULL", name="ck_mensaje_contenido"),
+        Index("ix_mensajes_consulta_fecha", "consulta_id", "created_at"),
+        # Un reintento del mismo envío (mismo client_id) no crea un mensaje duplicado
+        Index(
+            "uq_mensaje_client_id", "consulta_id", "autor_id", "client_id", unique=True,
+            postgresql_where=text("client_id IS NOT NULL"),
+        ),
+    )
+
+    id: Mapped[str] = mapped_column(
+        UUID(as_uuid=True),
+        primary_key=True,
+        server_default=text("uuid_generate_v4()"),
+    )
+    consulta_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("consultas.id", ondelete="CASCADE"), nullable=False)
+    autor_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False)
+    texto: Mapped[str] = mapped_column(Text, nullable=True)
+    imagen_url: Mapped[str] = mapped_column(Text, nullable=True)
+    client_id: Mapped[str] = mapped_column(String(64), nullable=True)
+    created_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False)
 
 async def get_db() -> AsyncGenerator[AsyncSession, None]:
     async with async_session() as session:

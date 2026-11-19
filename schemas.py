@@ -1,9 +1,9 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from typing import List, Literal, Optional
 from uuid import UUID
 
-from pydantic import BaseModel, EmailStr, Field
+from pydantic import BaseModel, ConfigDict, EmailStr, Field, field_validator
 
 
 class UserBase(BaseModel):
@@ -207,7 +207,7 @@ class MercadoProductos(BaseModel):
     maiz_duro: Optional[MaizDuroResumen] = None
 
 
-AssignableRole = Literal["agricultor", "investigador"]
+AssignableRole = Literal["agricultor", "investigador", "experto"]
 
 
 class AdminUserCreate(UserCreate):
@@ -217,3 +217,165 @@ class AdminUserCreate(UserCreate):
 class AdminUserUpdate(BaseModel):
     rol: Optional[AssignableRole] = None
     activo: Optional[bool] = None
+
+
+# ── Consultas a expertos ──────────────────────────────────────────────────────
+# Clases que devuelve el modelo (incluye las variantes antiguas de algunos registros)
+ClaseModelo = Literal["Fondo", "Fondo_y_Sana", "Tizon", "Roya", "Mancha_blanca", "Mancha_Blanca"]
+DiagnosticoExperto = Literal["Fondo", "Tizon", "Roya", "Mancha_blanca", "Otro"]
+
+
+def _utc_naive(value: datetime) -> datetime:
+    """Fechas con zona horaria → UTC sin zona (la convención de toda la base de datos)."""
+    if value.tzinfo is not None:
+        return value.astimezone(timezone.utc).replace(tzinfo=None)
+    return value
+
+
+class PuntoGeo(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    lat: float = Field(..., ge=-90, le=90)
+    lng: float = Field(..., ge=-180, le=180)
+
+
+class MuestraParcela(BaseModel):
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    etiqueta: str = Field(..., min_length=1, max_length=10)
+    lat: float = Field(..., ge=-90, le=90)
+    lng: float = Field(..., ge=-180, le=180)
+    clase: Optional[ClaseModelo] = None          # null = zona sin analizar
+    afectacion_pct: Optional[float] = Field(None, ge=0, le=100)
+
+
+class ParcelaSnapshot(BaseModel):
+    """Foto de una visita de parcela (los análisis por parcela viven en el navegador)."""
+    model_config = ConfigDict(extra="forbid", allow_inf_nan=False)
+    parcela_nombre: str = Field(..., min_length=1, max_length=120)
+    hectareas: float = Field(..., ge=0, le=100000)
+    fecha: datetime
+    vertices: List[PuntoGeo] = Field(..., min_length=3, max_length=200)
+    muestras: List[MuestraParcela] = Field(..., min_length=1, max_length=100)
+    afectacion_promedio: float = Field(..., ge=0, le=100)
+    zonas_afectadas: int = Field(..., ge=0, le=100)
+    zonas_total: int = Field(..., ge=0, le=100)
+
+    _fecha_utc = field_validator("fecha")(_utc_naive)
+
+
+class ConsultaCreate(BaseModel):
+    experto_id: UUID
+    tipo: Literal["individual", "parcela"]
+    analisis_id: Optional[UUID] = None                     # obligatorio si tipo = individual
+    referencia: Optional[str] = Field(None, min_length=1, max_length=100)
+    parcela: Optional[ParcelaSnapshot] = None              # obligatorio si tipo = parcela
+    mensaje: Optional[str] = Field(None, max_length=4000)  # primera pregunta, opcional
+    client_id: Optional[str] = Field(None, min_length=1, max_length=64)
+
+
+class MensajeCreate(BaseModel):
+    texto: Optional[str] = Field(None, max_length=4000)
+    imagen_url: Optional[str] = Field(None, max_length=2_800_000)  # data URL jpeg/png/webp ≤ 2 MB
+    client_id: Optional[str] = Field(None, min_length=1, max_length=64)
+
+
+class DictamenUpdate(BaseModel):
+    coincide: bool
+    diagnostico: DiagnosticoExperto
+    texto: str = Field(..., min_length=1, max_length=4000)
+
+
+class EstadoConsultaUpdate(BaseModel):
+    estado: Literal["abierta", "cerrada"]
+
+
+class ExpertoRead(BaseModel):
+    id: UUID
+    nombre: str
+    consultas_abiertas: int
+
+
+class ParticipanteRead(BaseModel):
+    id: UUID
+    nombre: str
+    rol: str
+
+
+class MensajeRead(BaseModel):
+    id: UUID
+    consulta_id: UUID
+    autor_id: UUID
+    texto: Optional[str] = None
+    imagen_url: Optional[str] = None
+    client_id: Optional[str] = None
+    created_at: datetime
+
+    class Config:
+        from_attributes = True
+
+
+class UltimoMensajeRead(BaseModel):
+    texto: Optional[str] = None      # recortado a 140 caracteres
+    tiene_imagen: bool
+    autor_id: UUID
+    created_at: datetime
+
+
+class DictamenRead(BaseModel):
+    coincide: bool
+    diagnostico: str
+    texto: str
+    fecha: datetime
+
+
+class ConsultaItem(BaseModel):
+    id: UUID
+    tipo: str
+    estado: str
+    created_at: datetime
+    ultimo_mensaje_at: datetime
+    rol_en_consulta: Literal["solicitante", "experto"]
+    contraparte: ParticipanteRead
+    resumen: dict                    # datos clave del análisis (versión corta)
+    ultimo_mensaje: Optional[UltimoMensajeRead] = None
+    no_leidos: int
+    nueva: bool                      # soy el experto y aún no la abrí
+    dictamen: Optional[DictamenRead] = None
+    dictamen_nuevo: bool             # soy el solicitante y hay un dictamen que no he visto
+
+
+class AnalisisConsultaRead(BaseModel):
+    id: UUID
+    imagen_url: str
+    grad_cam_url: Optional[str] = None
+    resultado_url: Optional[str] = None
+    fecha: datetime
+    afectacion_pct: Decimal
+    severidad: str
+    clase: str
+    clase_idx: int
+
+
+class ConsultaDetalle(ConsultaItem):
+    solicitante: ParticipanteRead
+    experto: ParticipanteRead
+    snapshot: dict                   # foto completa del análisis al enviarlo
+    analisis: Optional[AnalisisConsultaRead] = None   # imágenes, si el análisis individual sigue existiendo
+    leido_contraparte_at: Optional[datetime] = None   # para el doble check de «leído»
+    puede_escribir: bool
+    soy_experto: bool
+    cerrada_at: Optional[datetime] = None
+    ya_existia: bool = False         # POST /consultas devolvió una consulta abierta que ya existía
+
+
+class MensajesRespuesta(BaseModel):
+    mensajes: List[MensajeRead]
+    estado: str
+    leido_contraparte_at: Optional[datetime] = None
+    dictamen_fecha: Optional[datetime] = None
+    ultimo_mensaje_at: datetime
+
+
+class ConsultasResumen(BaseModel):
+    no_leidos: int                   # mensajes sin leer en todas mis consultas
+    consultas_con_novedad: int       # consultas con mensajes nuevos, sin abrir o con dictamen nuevo
+    nuevas: int                      # (experto) consultas recibidas que aún no abrió

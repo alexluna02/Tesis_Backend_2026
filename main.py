@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import hmac
+import math
 import os
 import secrets
 import smtplib
@@ -12,13 +13,17 @@ from typing import List
 from uuid import UUID
 
 import httpx
-from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, UploadFile, status
+from fastapi import BackgroundTasks, Depends, FastAPI, File, HTTPException, Request, UploadFile, status
+from fastapi.encoders import jsonable_encoder
+from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from sqlalchemy import select, text, update
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy.orm import selectinload
 
 import auth
+import consultas
 import database
 import mercado
 import schemas
@@ -165,9 +170,64 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
+# Consultas a expertos: /expertos y /consultas/* (ver consultas.py)
+app.include_router(consultas.router)
+
+
+def _sin_no_finitos(valor):
+    """NaN e infinito no existen en JSON: se devuelven como texto."""
+    if isinstance(valor, float) and not math.isfinite(valor):
+        return str(valor)
+    if isinstance(valor, dict):
+        return {k: _sin_no_finitos(v) for k, v in valor.items()}
+    if isinstance(valor, (list, tuple)):
+        return [_sin_no_finitos(v) for v in valor]
+    return valor
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_exception_handler(request: Request, exc: RequestValidationError):
+    # Igual que el manejador de FastAPI (422 con {"detail": errores}), pero si el cliente envió NaN o
+    # infinito el error ya no rompe la respuesta con un 500 al no poder convertirlo a JSON.
+    return JSONResponse(status_code=422, content={"detail": _sin_no_finitos(jsonable_encoder(exc.errors()))})
+
+
 MODEL_PATH = os.environ.get("MODEL_PATH", "Mit_B0_384_Test.pth")
 model = None
 MODEL_LOAD_TIME_MS: float | None = None
+
+
+async def _ensure_schema() -> None:
+    """Crea o actualiza el esquema de forma idempotente (se ejecuta en cada arranque).
+
+    Las tablas nuevas (p. ej. consultas y mensajes_consulta) las crea create_all; las columnas y
+    valores de ENUM añadidos después se aplican con sentencias IF NOT EXISTS.
+    """
+    async with database.engine.begin() as conn:
+        await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                CREATE TYPE rol_usuario AS ENUM ('agricultor', 'investigador', 'director', 'admin', 'experto');
+            EXCEPTION WHEN duplicate_object THEN null; END $$
+        """))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                CREATE TYPE nivel_severidad AS ENUM ('leve', 'moderada', 'grave');
+            EXCEPTION WHEN duplicate_object THEN null; END $$
+        """))
+        await conn.run_sync(database.Base.metadata.create_all)
+    # 'agricultor' was added after the enum was first created; the new value
+    # must be committed before it can be used as the column default.
+    async with database.engine.begin() as conn:
+        await conn.execute(text("ALTER TYPE rol_usuario ADD VALUE IF NOT EXISTS 'agricultor'"))
+    # Rol de los expertos que atienden las consultas (en su propia transacción, como el anterior)
+    async with database.engine.begin() as conn:
+        await conn.execute(text("ALTER TYPE rol_usuario ADD VALUE IF NOT EXISTS 'experto'"))
+    async with database.engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE usuarios ALTER COLUMN rol SET DEFAULT 'agricultor'"))
+    # Columna añadida después de crear la tabla: create_all no altera tablas existentes
+    async with database.engine.begin() as conn:
+        await conn.execute(text("ALTER TABLE analisis ADD COLUMN IF NOT EXISTS resultado_url TEXT"))
 
 
 @app.on_event("startup")
@@ -181,28 +241,7 @@ async def startup_event():
     # ── Auto-create schema (idempotent — safe to run every startup) ──────────
     # Required the first time the app connects to a fresh cloud DB (e.g. Render).
     try:
-        async with database.engine.begin() as conn:
-            await conn.execute(text('CREATE EXTENSION IF NOT EXISTS "uuid-ossp"'))
-            await conn.execute(text("""
-                DO $$ BEGIN
-                    CREATE TYPE rol_usuario AS ENUM ('agricultor', 'investigador', 'director', 'admin');
-                EXCEPTION WHEN duplicate_object THEN null; END $$
-            """))
-            await conn.execute(text("""
-                DO $$ BEGIN
-                    CREATE TYPE nivel_severidad AS ENUM ('leve', 'moderada', 'grave');
-                EXCEPTION WHEN duplicate_object THEN null; END $$
-            """))
-            await conn.run_sync(database.Base.metadata.create_all)
-        # 'agricultor' was added after the enum was first created; the new value
-        # must be committed before it can be used as the column default.
-        async with database.engine.begin() as conn:
-            await conn.execute(text("ALTER TYPE rol_usuario ADD VALUE IF NOT EXISTS 'agricultor'"))
-        async with database.engine.begin() as conn:
-            await conn.execute(text("ALTER TABLE usuarios ALTER COLUMN rol SET DEFAULT 'agricultor'"))
-        # Columna añadida después de crear la tabla: create_all no altera tablas existentes
-        async with database.engine.begin() as conn:
-            await conn.execute(text("ALTER TABLE analisis ADD COLUMN IF NOT EXISTS resultado_url TEXT"))
+        await _ensure_schema()
         print("[startup] Schema listo")
     except Exception as exc:
         print(f"[startup] Error creando schema: {exc}")
@@ -396,8 +435,8 @@ async def change_password(
 
 
 # ── Admin: gestión de usuarios ────────────────────────────────────────────────
-# La cuenta admin es única: desde aquí solo se asignan los roles agricultor e
-# investigador, y el admin no puede modificarse a sí mismo ni a otro admin.
+# La cuenta admin es única: desde aquí solo se asignan los roles agricultor,
+# investigador y experto, y el admin no puede modificarse a sí mismo ni a otro admin.
 
 async def _get_managed_user(db: AsyncSession, user_id: UUID, admin: database.Usuario) -> database.Usuario:
     user = await db.get(database.Usuario, user_id)
