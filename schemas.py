@@ -21,6 +21,7 @@ class UserRead(UserBase):
     activo: bool
     created_at: datetime
     updated_at: datetime
+    especialidad: Optional[str] = None
 
     class Config:
         from_attributes = True
@@ -57,6 +58,8 @@ class GoogleLoginRequest(BaseModel):
 
 class UserUpdate(BaseModel):
     nombre: str = Field(..., min_length=1, max_length=150, example="María Pérez")
+    # Solo si se envía: la especialidad que el experto muestra a los agricultores
+    especialidad: Optional[str] = Field(None, max_length=80, example="Fitopatología del maíz")
 
 
 class PasswordChange(BaseModel):
@@ -264,7 +267,7 @@ class ParcelaSnapshot(BaseModel):
 
 class ConsultaCreate(BaseModel):
     experto_id: UUID
-    tipo: Literal["individual", "parcela"]
+    tipo: Literal["individual", "parcela", "general"]       # general = chat libre con el experto
     analisis_id: Optional[UUID] = None                     # obligatorio si tipo = individual
     referencia: Optional[str] = Field(None, min_length=1, max_length=100)
     parcela: Optional[ParcelaSnapshot] = None              # obligatorio si tipo = parcela
@@ -292,12 +295,18 @@ class ExpertoRead(BaseModel):
     id: UUID
     nombre: str
     consultas_abiertas: int
+    especialidad: Optional[str] = None
+    en_linea: bool = False                           # con actividad en los últimos 90 s
+    ultima_actividad: Optional[datetime] = None
 
 
 class ParticipanteRead(BaseModel):
     id: UUID
     nombre: str
     rol: str
+    especialidad: Optional[str] = None
+    en_linea: bool = False
+    ultima_actividad: Optional[datetime] = None
 
 
 class MensajeRead(BaseModel):
@@ -306,6 +315,8 @@ class MensajeRead(BaseModel):
     autor_id: UUID
     texto: Optional[str] = None
     imagen_url: Optional[str] = None
+    documento_nombre: Optional[str] = None           # PDF adjunto: se descarga aparte
+    documento_tamano: Optional[int] = None           # bytes
     client_id: Optional[str] = None
     created_at: datetime
 
@@ -316,6 +327,7 @@ class MensajeRead(BaseModel):
 class UltimoMensajeRead(BaseModel):
     texto: Optional[str] = None      # recortado a 140 caracteres
     tiene_imagen: bool
+    documento_nombre: Optional[str] = None
     autor_id: UUID
     created_at: datetime
 

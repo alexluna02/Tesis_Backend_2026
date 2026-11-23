@@ -1,24 +1,29 @@
 """Consultas a expertos.
 
-Un usuario (normalmente un agricultor) envía uno de sus análisis —individual o por parcela— a un
-experto registrado. El experto lo revisa, puede emitir su propio dictamen y ambos conversan en un
-chat privado. El frontend usa polling (no hay WebSockets):
-  • GET /consultas/resumen            → campana de notificaciones (cada ~30 s)
+Un usuario (normalmente un agricultor) conversa en un chat privado con un experto registrado.
+  • Chat general (tipo 'general'): una conversación abierta por usuario y experto. El análisis se
+    comparte como documento PDF (el reporte que la app ya exporta), además de texto e imágenes.
+  • Consultas sobre un análisis (tipos 'individual' y 'parcela'): llevan una foto del análisis y
+    el experto puede emitir un dictamen.
+El frontend usa polling (no hay WebSockets):
+  • GET /consultas/resumen            → campana de notificaciones (cada ~30 s); también sirve de
+                                         señal de actividad para mostrar «En línea»
   • GET /consultas/{id}/mensajes      → chat abierto (cada ~5 s, con ?despues=)
 
-Reglas de acceso: solo los dos participantes ven una consulta; para cualquier otro usuario la
-consulta «no existe» (404). Todas las marcas de tiempo se escriben aquí en UTC naive (la
-convención de la base de datos), así mensajes y lecturas son comparables entre sí.
+Reglas de acceso: solo los dos participantes ven una consulta y sus documentos; para cualquier
+otro usuario la consulta «no existe» (404). Todas las marcas de tiempo se escriben aquí en UTC
+naive (la convención de la base de datos), así mensajes y lecturas son comparables entre sí.
 """
 import base64
 import binascii
 import re
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from typing import List, Optional
+from urllib.parse import quote
 from uuid import UUID
 
-from fastapi import APIRouter, Depends, HTTPException, Query, Response, status
+from fastapi import APIRouter, Depends, File, Form, HTTPException, Query, Response, UploadFile, status
 from sqlalchemy import case, func, or_, select
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.ext.asyncio import AsyncSession
@@ -38,9 +43,13 @@ LISTA_MAX = 200
 MENSAJES_MAX = 500
 VISTA_PREVIA = 140
 IMAGEN_MAX_BYTES = 2 * 1024 * 1024
+DOCUMENTO_MAX_BYTES = 10 * 1024 * 1024            # el PDF del análisis incluye la foto original
+EN_LINEA = timedelta(seconds=90)                  # el frontend da señal cada ~30 s
+LATIDO_MIN = timedelta(seconds=20)                # no se escribe la actividad más seguido que esto
 _DATA_URL = re.compile(r"^data:image/(jpeg|png|webp);base64,([A-Za-z0-9+/]+={0,2})$")
 _FIRMAS = {"jpeg": b"\xff\xd8\xff", "png": b"\x89PNG\r\n\x1a\n", "webp": b"RIFF"}
 _SANAS = {"Fondo", "Fondo_y_Sana"}
+_CARACTERES_NO_VALIDOS = re.compile(r'[\x00-\x1f\x7f<>:"/\\|?*]')
 
 
 def _ahora() -> datetime:
@@ -75,6 +84,34 @@ def _validar_imagen(data_url: str) -> str:
 def _texto_limpio(texto: Optional[str]) -> Optional[str]:
     texto = (texto or "").strip()
     return texto or None
+
+
+def _nombre_documento(nombre: Optional[str]) -> str:
+    """Nombre seguro para mostrar y descargar: sin rutas ni caracteres de control, ≤ 120 caracteres
+    y con extensión .pdf."""
+    base = (nombre or "").replace("\\", "/").rsplit("/", 1)[-1]
+    # Los navegadores envían « " », CR y LF del nombre como %22, %0D y %0A: también se quitan
+    for codificado in ("%22", "%0D", "%0A", "%0d", "%0a"):
+        base = base.replace(codificado, "")
+    base = _CARACTERES_NO_VALIDOS.sub("", base).strip().strip(".").strip()
+    if not base.lower().endswith(".pdf"):
+        base = f"{base or 'documento'}.pdf"
+    if len(base) > 120:
+        base = base[:-4][:116].rstrip() + ".pdf"
+    return base
+
+
+def _en_linea(user: database.Usuario) -> bool:
+    return user.ultima_actividad is not None and _ahora() - user.ultima_actividad <= EN_LINEA
+
+
+def _registrar_actividad(user: database.Usuario) -> bool:
+    """Marca al usuario como activo ahora (sin commit). Devuelve True si cambió algo."""
+    ahora = _ahora()
+    if user.ultima_actividad is None or ahora - user.ultima_actividad >= LATIDO_MIN:
+        user.ultima_actividad = ahora
+        return True
+    return False
 
 
 async def _consulta_de(db: AsyncSession, consulta_id: UUID, user: database.Usuario) -> database.Consulta:
@@ -112,6 +149,8 @@ def _clase_dominante(muestras: list) -> str:
 
 def _resumen_corto(consulta: database.Consulta) -> dict:
     datos = consulta.resumen or {}
+    if consulta.tipo == "general":
+        return {}
     if consulta.tipo == "individual":
         claves = ("clase", "clase_idx", "afectacion_pct", "severidad", "fecha")
     else:
@@ -120,7 +159,10 @@ def _resumen_corto(consulta: database.Consulta) -> dict:
 
 
 def _participante(user: database.Usuario) -> schemas.ParticipanteRead:
-    return schemas.ParticipanteRead(id=user.id, nombre=user.nombre, rol=user.rol)
+    return schemas.ParticipanteRead(
+        id=user.id, nombre=user.nombre, rol=user.rol, especialidad=user.especialidad,
+        en_linea=_en_linea(user), ultima_actividad=user.ultima_actividad,
+    )
 
 
 def _dictamen(consulta: database.Consulta) -> Optional[schemas.DictamenRead]:
@@ -167,6 +209,7 @@ async def _ultimos_mensajes(db: AsyncSession, ids: List) -> dict:
             M.consulta_id,
             func.left(M.texto, VISTA_PREVIA).label("texto"),
             M.imagen_url.is_not(None).label("tiene_imagen"),
+            M.documento_nombre,
             M.autor_id,
             M.created_at,
         )
@@ -175,7 +218,10 @@ async def _ultimos_mensajes(db: AsyncSession, ids: List) -> dict:
         .order_by(M.consulta_id, M.created_at.desc(), M.id.desc())
     )).all()
     return {
-        f.consulta_id: schemas.UltimoMensajeRead(texto=f.texto, tiene_imagen=f.tiene_imagen, autor_id=f.autor_id, created_at=f.created_at)
+        f.consulta_id: schemas.UltimoMensajeRead(
+            texto=f.texto, tiene_imagen=f.tiene_imagen, documento_nombre=f.documento_nombre,
+            autor_id=f.autor_id, created_at=f.created_at,
+        )
         for f in filas
     }
 
@@ -247,25 +293,38 @@ async def _agregar_mensaje(
     texto: Optional[str],
     imagen_url: Optional[str],
     client_id: Optional[str],
+    documento: Optional[tuple[str, bytes]] = None,
 ) -> tuple[database.MensajeConsulta, bool]:
     """Agrega un mensaje (sin commit). Si ya existe uno con el mismo client_id (reintento del mismo
-    envío), devuelve ese y no crea otro. Devuelve (mensaje, es_nuevo)."""
+    envío), devuelve ese y no crea otro. `documento` = (nombre, bytes del PDF). Devuelve (mensaje, es_nuevo)."""
     if client_id:
-        existente = (await db.execute(
-            select(M).where(M.consulta_id == consulta.id, M.autor_id == user.id, M.client_id == client_id)
-        )).scalars().first()
+        existente = await _mensaje_por_client_id(db, consulta.id, user.id, client_id)
         if existente is not None:
             return existente, False
     ahora = _ahora()
     mensaje = M(consulta_id=consulta.id, autor_id=user.id, texto=texto, imagen_url=imagen_url, client_id=client_id, created_at=ahora)
+    if documento is not None:
+        mensaje.documento_nombre, mensaje.documento_datos = documento
+        mensaje.documento_tamano = len(documento[1])
     db.add(mensaje)
     consulta.ultimo_mensaje_at = ahora
     _marcar_leido(consulta, user, ahora)   # quien escribe ya vio todo lo anterior
     return mensaje, True
 
 
-async def _consulta_abierta_igual(db: AsyncSession, user, experto_id, analisis_id, referencia) -> Optional[database.Consulta]:
-    filtro = (C.analisis_id == analisis_id) if analisis_id is not None else (C.referencia == referencia)
+async def _mensaje_por_client_id(db: AsyncSession, consulta_id, autor_id, client_id: str) -> Optional[database.MensajeConsulta]:
+    return (await db.execute(
+        select(M).where(M.consulta_id == consulta_id, M.autor_id == autor_id, M.client_id == client_id)
+    )).scalars().first()
+
+
+async def _consulta_abierta_igual(db: AsyncSession, user, experto_id, analisis_id, referencia, tipo: str) -> Optional[database.Consulta]:
+    if tipo == "general":
+        filtro = C.tipo == "general"
+    elif analisis_id is not None:
+        filtro = C.analisis_id == analisis_id
+    else:
+        filtro = C.referencia == referencia
     return (await db.execute(
         select(C).where(C.solicitante_id == user.id, C.experto_id == experto_id, C.estado == "abierta", filtro)
     )).scalars().first()
@@ -284,12 +343,18 @@ async def listar_expertos(
         .subquery()
     )
     filas = (await db.execute(
-        select(U.id, U.nombre, func.coalesce(abiertas.c.n, 0))
+        select(U, func.coalesce(abiertas.c.n, 0))
         .outerjoin(abiertas, abiertas.c.experto_id == U.id)
         .where(U.rol == "experto", U.activo.is_(True), U.id != user.id)
         .order_by(U.nombre)
     )).all()
-    return [schemas.ExpertoRead(id=i, nombre=n, consultas_abiertas=k) for i, n, k in filas]
+    return [
+        schemas.ExpertoRead(
+            id=e.id, nombre=e.nombre, consultas_abiertas=k, especialidad=e.especialidad,
+            en_linea=_en_linea(e), ultima_actividad=e.ultima_actividad,
+        )
+        for e, k in filas
+    ]
 
 
 # ── Crear y listar consultas ──────────────────────────────────────────────────
@@ -327,6 +392,10 @@ async def crear_consulta(
             "fecha": analisis.fecha.isoformat(),
         }
         analisis_id, referencia = analisis.id, None
+    elif req.tipo == "general":
+        # Chat libre: el análisis se comparte después como documento PDF dentro de la conversación
+        snapshot = {"tipo": "general"}
+        analisis_id, referencia = None, None
     else:
         if req.parcela is None:
             raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Faltan los datos de la parcela.")
@@ -344,8 +413,8 @@ async def crear_consulta(
         response.status_code = status.HTTP_200_OK
         return await _detalle(db, existente, user, ya_existia=True)
 
-    if analisis_id is not None or referencia is not None:
-        existente = await _consulta_abierta_igual(db, user, experto_id, analisis_id, referencia)
+    if req.tipo == "general" or analisis_id is not None or referencia is not None:
+        existente = await _consulta_abierta_igual(db, user, experto_id, analisis_id, referencia, req.tipo)
         if existente is not None:
             return await devolver_existente(existente)
 
@@ -369,7 +438,7 @@ async def crear_consulta(
         # Carrera (doble clic): otra petición acaba de crear la misma consulta
         await db.rollback()
         await db.refresh(user)    # el rollback lo expiró; en async no se puede recargar de forma implícita
-        existente = await _consulta_abierta_igual(db, user, experto_id, analisis_id, referencia)
+        existente = await _consulta_abierta_igual(db, user, experto_id, analisis_id, referencia, req.tipo)
         if existente is None:
             raise
         return await devolver_existente(existente)
@@ -414,6 +483,9 @@ async def resumen_consultas(
     user: database.Usuario = Depends(auth.get_current_active_user),
     db: AsyncSession = Depends(database.get_db),
 ):
+    # El frontend pide el resumen cada ~30 s mientras la app está visible: es la señal de «En línea»
+    if _registrar_actividad(user):
+        await db.commit()
     mias = or_(C.solicitante_id == user.id, C.experto_id == user.id)
     con_mensajes = (await db.execute(
         select(M.consulta_id, func.count())
@@ -502,6 +574,78 @@ async def enviar_mensaje(
     if not nuevo:
         response.status_code = status.HTTP_200_OK
     return mensaje
+
+
+@router.post("/consultas/{consulta_id}/documentos", response_model=schemas.MensajeRead, status_code=status.HTTP_201_CREATED)
+async def enviar_documento(
+    consulta_id: UUID,
+    response: Response,
+    archivo: UploadFile = File(..., description="Documento PDF (≤ 10 MB), p. ej. el reporte de un análisis"),
+    texto: Optional[str] = Form(None, max_length=4000),
+    client_id: Optional[str] = Form(None, min_length=1, max_length=64),
+    user: database.Usuario = Depends(auth.get_current_active_user),
+    db: AsyncSession = Depends(database.get_db),
+):
+    """Envía un PDF al chat (multipart/form-data), con un texto opcional."""
+    consulta = await _consulta_de(db, consulta_id, user)
+    if consulta.estado != "abierta":
+        raise HTTPException(status_code=status.HTTP_409_CONFLICT, detail="La consulta está cerrada. Reábrela para seguir escribiendo.")
+    if client_id:
+        # Reintento del mismo envío: se devuelve el mensaje ya guardado sin volver a procesar el archivo
+        existente = await _mensaje_por_client_id(db, consulta.id, user.id, client_id)
+        if existente is not None:
+            response.status_code = status.HTTP_200_OK
+            return existente
+    datos = await archivo.read(DOCUMENTO_MAX_BYTES + 1)
+    if len(datos) > DOCUMENTO_MAX_BYTES:
+        raise HTTPException(status_code=status.HTTP_413_REQUEST_ENTITY_TOO_LARGE, detail="El documento supera los 10 MB.")
+    if not datos.startswith(b"%PDF-"):
+        raise HTTPException(status_code=status.HTTP_400_BAD_REQUEST, detail="Solo se pueden enviar documentos PDF.")
+    documento = (_nombre_documento(archivo.filename), datos)
+    try:
+        mensaje, nuevo = await _agregar_mensaje(db, consulta, user, _texto_limpio(texto), None, client_id, documento)
+        await db.commit()
+    except IntegrityError:
+        # Carrera entre dos reintentos con el mismo client_id: se devuelve el que quedó guardado
+        await db.rollback()
+        await db.refresh(user)
+        mensaje = await _mensaje_por_client_id(db, consulta_id, user.id, client_id) if client_id else None
+        if mensaje is None:
+            raise
+        nuevo = False
+    if not nuevo:
+        response.status_code = status.HTTP_200_OK
+    return mensaje
+
+
+@router.get(
+    "/consultas/{consulta_id}/mensajes/{mensaje_id}/documento",
+    response_class=Response,
+    responses={200: {"content": {"application/pdf": {}}, "description": "El PDF adjunto"}},
+)
+async def descargar_documento(
+    consulta_id: UUID,
+    mensaje_id: UUID,
+    user: database.Usuario = Depends(auth.get_current_active_user),
+    db: AsyncSession = Depends(database.get_db),
+):
+    consulta = await _consulta_de(db, consulta_id, user)
+    fila = (await db.execute(
+        select(M.documento_nombre, M.documento_datos).where(M.id == mensaje_id, M.consulta_id == consulta.id)
+    )).first()
+    if fila is None or fila.documento_datos is None:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="Documento no encontrado")
+    nombre = fila.documento_nombre
+    ascii_nombre = nombre.encode("ascii", "ignore").decode().replace('"', "") or "documento.pdf"
+    return Response(
+        content=fila.documento_datos,
+        media_type="application/pdf",
+        headers={
+            "Content-Disposition": f"attachment; filename=\"{ascii_nombre}\"; filename*=UTF-8''{quote(nombre)}",
+            "Cache-Control": "private, no-store",
+            "X-Content-Type-Options": "nosniff",
+        },
+    )
 
 
 @router.post("/consultas/{consulta_id}/leer", status_code=status.HTTP_204_NO_CONTENT)

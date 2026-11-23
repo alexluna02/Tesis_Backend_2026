@@ -228,6 +228,41 @@ async def _ensure_schema() -> None:
     # Columna añadida después de crear la tabla: create_all no altera tablas existentes
     async with database.engine.begin() as conn:
         await conn.execute(text("ALTER TABLE analisis ADD COLUMN IF NOT EXISTS resultado_url TEXT"))
+    # Chat general con expertos y documentos PDF: columnas nuevas en tablas que ya existen, y las dos
+    # restricciones que cambiaron (se reemplazan solo si aún tienen la definición anterior)
+    async with database.engine.begin() as conn:
+        for sentencia in (
+            "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS especialidad VARCHAR(80)",
+            "ALTER TABLE usuarios ADD COLUMN IF NOT EXISTS ultima_actividad TIMESTAMP WITHOUT TIME ZONE",
+            "ALTER TABLE mensajes_consulta ADD COLUMN IF NOT EXISTS documento_nombre VARCHAR(160)",
+            "ALTER TABLE mensajes_consulta ADD COLUMN IF NOT EXISTS documento_tamano INTEGER",
+            "ALTER TABLE mensajes_consulta ADD COLUMN IF NOT EXISTS documento_datos BYTEA",
+        ):
+            await conn.execute(text(sentencia))
+        await conn.execute(text("""
+            DO $$ BEGIN
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_consulta_tipo'
+                               AND pg_get_constraintdef(oid) LIKE '%general%') THEN
+                    ALTER TABLE consultas DROP CONSTRAINT IF EXISTS ck_consulta_tipo;
+                    ALTER TABLE consultas ADD CONSTRAINT ck_consulta_tipo
+                        CHECK (tipo IN ('individual', 'parcela', 'general'));
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_mensaje_contenido'
+                               AND pg_get_constraintdef(oid) LIKE '%documento_datos%') THEN
+                    ALTER TABLE mensajes_consulta DROP CONSTRAINT IF EXISTS ck_mensaje_contenido;
+                    ALTER TABLE mensajes_consulta ADD CONSTRAINT ck_mensaje_contenido
+                        CHECK (texto IS NOT NULL OR imagen_url IS NOT NULL OR documento_datos IS NOT NULL);
+                END IF;
+                IF NOT EXISTS (SELECT 1 FROM pg_constraint WHERE conname = 'ck_mensaje_documento') THEN
+                    ALTER TABLE mensajes_consulta ADD CONSTRAINT ck_mensaje_documento
+                        CHECK ((documento_datos IS NULL) = (documento_nombre IS NULL));
+                END IF;
+            END $$
+        """))
+        await conn.execute(text("""
+            CREATE UNIQUE INDEX IF NOT EXISTS uq_consulta_general_abierta ON consultas (solicitante_id, experto_id)
+            WHERE estado = 'abierta' AND tipo = 'general'
+        """))
 
 
 @app.on_event("startup")
@@ -414,6 +449,9 @@ async def update_profile(
     db: AsyncSession = Depends(database.get_db),
 ):
     current_user.nombre = update.nombre.strip()
+    # La especialidad solo cambia si viene en la petición (vacía = quitarla)
+    if "especialidad" in update.model_fields_set:
+        current_user.especialidad = (update.especialidad or "").strip() or None
     current_user.updated_at = datetime.now(timezone.utc).replace(tzinfo=None)
     await db.commit()
     await db.refresh(current_user)

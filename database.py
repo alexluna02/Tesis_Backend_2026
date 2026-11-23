@@ -5,8 +5,8 @@ from dotenv import load_dotenv
 
 load_dotenv()
 
-from sqlalchemy import (Boolean, CheckConstraint, Column, DateTime, ForeignKey, Index, Integer, SmallInteger,
-                        String, Text, UniqueConstraint, func, text, Numeric)
+from sqlalchemy import (Boolean, CheckConstraint, Column, DateTime, ForeignKey, Index, Integer, LargeBinary,
+                        SmallInteger, String, Text, UniqueConstraint, func, text, Numeric)
 from sqlalchemy.dialects.postgresql import JSONB, UUID, ENUM
 from sqlalchemy.ext.asyncio import AsyncSession, async_sessionmaker, create_async_engine
 from sqlalchemy.orm import DeclarativeBase, Mapped, mapped_column, relationship
@@ -90,6 +90,10 @@ class Usuario(Base):
     activo: Mapped[bool] = mapped_column(Boolean, nullable=False, server_default=text("TRUE"))
     created_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False, server_default=func.now())
     updated_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False, server_default=func.now())
+    # Especialidad que el experto escribe en su perfil (se muestra en «Nuestros expertos»)
+    especialidad: Mapped[str] = mapped_column(String(80), nullable=True)
+    # Última señal de actividad en la app (UTC naive): con ella se muestra «En línea»
+    ultima_actividad: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=True)
 
     refresh_tokens: Mapped[list["RefreshToken"]] = relationship(
         "RefreshToken", back_populates="user", cascade="all, delete-orphan"
@@ -181,15 +185,17 @@ class PrecioMercado(Base):
 
 
 class Consulta(Base):
-    """Consulta de un usuario (normalmente un agricultor) a un experto sobre uno de sus análisis.
+    """Conversación de un usuario (normalmente un agricultor) con un experto.
 
-    `resumen` guarda una foto del análisis al enviarlo: los análisis por parcela viven en el navegador
-    y el análisis individual puede borrarse después (entonces `analisis_id` pasa a NULL).
+    tipo 'general': chat libre con el experto (una conversación abierta por pareja); el análisis se
+    comparte como documento PDF dentro del chat. Los tipos 'individual' y 'parcela' son consultas
+    sobre un análisis concreto: `resumen` guarda una foto del análisis al enviarlo (los análisis por
+    parcela viven en el navegador y el individual puede borrarse; entonces `analisis_id` pasa a NULL).
     Todas las marcas de tiempo se escriben desde Python en UTC naive para poder compararlas entre sí.
     """
     __tablename__ = "consultas"
     __table_args__ = (
-        CheckConstraint("tipo IN ('individual', 'parcela')", name="ck_consulta_tipo"),
+        CheckConstraint("tipo IN ('individual', 'parcela', 'general')", name="ck_consulta_tipo"),
         CheckConstraint("estado IN ('abierta', 'cerrada')", name="ck_consulta_estado"),
         CheckConstraint("solicitante_id <> experto_id", name="ck_consulta_participantes"),
         CheckConstraint(
@@ -207,6 +213,11 @@ class Consulta(Base):
             "uq_consulta_abierta_referencia", "solicitante_id", "experto_id", "referencia", unique=True,
             postgresql_where=text("estado = 'abierta' AND referencia IS NOT NULL"),
         ),
+        # Un solo chat general abierto por usuario y experto
+        Index(
+            "uq_consulta_general_abierta", "solicitante_id", "experto_id", unique=True,
+            postgresql_where=text("estado = 'abierta' AND tipo = 'general'"),
+        ),
     )
 
     id: Mapped[str] = mapped_column(
@@ -216,7 +227,7 @@ class Consulta(Base):
     )
     solicitante_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False)
     experto_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False)
-    tipo: Mapped[str] = mapped_column(String(20), nullable=False)  # 'individual' | 'parcela'
+    tipo: Mapped[str] = mapped_column(String(20), nullable=False)  # 'individual' | 'parcela' | 'general'
     # Si el dueño borra el análisis, la consulta se conserva con su resumen
     analisis_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("analisis.id", ondelete="SET NULL"), nullable=True)
     # Identificador de la visita de parcela en el navegador (para no enviar dos veces la misma)
@@ -237,10 +248,13 @@ class Consulta(Base):
 
 
 class MensajeConsulta(Base):
-    """Mensaje del chat de una consulta: texto, imagen (data URL) o ambos."""
+    """Mensaje del chat de una consulta: texto, imagen (data URL), documento PDF o texto con adjunto."""
     __tablename__ = "mensajes_consulta"
     __table_args__ = (
-        CheckConstraint("texto IS NOT NULL OR imagen_url IS NOT NULL", name="ck_mensaje_contenido"),
+        CheckConstraint(
+            "texto IS NOT NULL OR imagen_url IS NOT NULL OR documento_datos IS NOT NULL", name="ck_mensaje_contenido",
+        ),
+        CheckConstraint("(documento_datos IS NULL) = (documento_nombre IS NULL)", name="ck_mensaje_documento"),
         Index("ix_mensajes_consulta_fecha", "consulta_id", "created_at"),
         # Un reintento del mismo envío (mismo client_id) no crea un mensaje duplicado
         Index(
@@ -258,6 +272,11 @@ class MensajeConsulta(Base):
     autor_id: Mapped[str] = mapped_column(UUID(as_uuid=True), ForeignKey("usuarios.id", ondelete="CASCADE"), nullable=False)
     texto: Mapped[str] = mapped_column(Text, nullable=True)
     imagen_url: Mapped[str] = mapped_column(Text, nullable=True)
+    # Documento PDF adjunto (p. ej. el reporte de un análisis). Los bytes no se cargan con el
+    # mensaje (deferred): solo los lee el endpoint de descarga.
+    documento_nombre: Mapped[str] = mapped_column(String(160), nullable=True)
+    documento_tamano: Mapped[int] = mapped_column(Integer, nullable=True)
+    documento_datos: Mapped[bytes] = mapped_column(LargeBinary, nullable=True, deferred=True)
     client_id: Mapped[str] = mapped_column(String(64), nullable=True)
     created_at: Mapped[str] = mapped_column(DateTime(timezone=False), nullable=False)
 
