@@ -29,7 +29,13 @@ import mercado
 import schemas
 from model import CFG, GRADCAM_ERROR, XAI_AVAILABLE, generate_xai, load_model, predict_from_bytes
 
-# ── SMTP config ───────────────────────────────────────────────────────────────
+# ── Envío de correos ──────────────────────────────────────────────────────────
+# Hugging Face Spaces bloquea las conexiones SMTP salientes (puertos 25, 465 y 587): allí el correo
+# sale por HTTPS a un Google Apps Script publicado con la cuenta de Gmail del proyecto, que lo envía
+# con MailApp (MAIL_RELAY_URL + MAIL_RELAY_SECRET). Sin relay se usa SMTP, que sí funciona en local.
+MAIL_RELAY_URL    = os.getenv("MAIL_RELAY_URL", "").strip()
+MAIL_RELAY_SECRET = os.getenv("MAIL_RELAY_SECRET", "").strip()
+
 SMTP_HOST     = os.getenv("SMTP_HOST", "smtp.gmail.com")
 SMTP_PORT     = int(os.getenv("SMTP_PORT", "587"))
 SMTP_USER     = os.getenv("SMTP_USER", "")
@@ -81,12 +87,39 @@ def _send_email_sync(to: str, subject: str, html: str) -> None:
         srv.sendmail(SMTP_USER, to, msg.as_string())
 
 
+async def _send_email_relay(to: str, subject: str, html: str) -> None:
+    """Envía el correo por HTTPS al Apps Script. El script responde «ok» o «error: …»; Google
+    contesta el POST con una redirección (302) a la página del resultado, por eso se sigue."""
+    async with httpx.AsyncClient(timeout=30, follow_redirects=True) as client:
+        respuesta = await client.post(
+            MAIL_RELAY_URL,
+            json={"secret": MAIL_RELAY_SECRET, "to": to, "subject": subject, "html": html},
+        )
+    cuerpo = respuesta.text.strip()
+    if respuesta.status_code != 200 or cuerpo != "ok":
+        raise RuntimeError(f"el relay de correo respondió HTTP {respuesta.status_code}: {cuerpo[:200]}")
+
+
+def _email_transport() -> str:
+    if MAIL_RELAY_URL and MAIL_RELAY_SECRET:
+        return "relay"
+    if SMTP_USER and SMTP_PASSWORD and not SMTP_USER.startswith("TU_CORREO"):
+        return "smtp"
+    return "sin configurar"
+
+
 async def send_reset_email(to: str, code: str) -> None:
-    if not SMTP_USER or not SMTP_PASSWORD or SMTP_USER.startswith("TU_CORREO"):
-        print(f"[AgroScan] SMTP no configurado. Código de recuperación para {to}: {code}")
+    subject = "Código de recuperación - AgroScan"
+    transporte = _email_transport()
+    if transporte == "sin configurar":
+        print(f"[AgroScan] Correo no configurado. Código de recuperación para {to}: {code}")
         return
     html = _build_reset_email_html(code)
-    await asyncio.to_thread(_send_email_sync, to, "Código de recuperación - AgroScan", html)
+    if transporte == "relay":
+        await _send_email_relay(to, subject, html)
+    else:
+        await asyncio.to_thread(_send_email_sync, to, subject, html)
+    print(f"[AgroScan] Código de recuperación enviado a {to} ({transporte})")
 
 
 def _utcnow() -> datetime:
@@ -329,6 +362,7 @@ async def health_check(db: AsyncSession = Depends(database.get_db)):
         "model_path": MODEL_PATH,
         "model_load_time_ms": MODEL_LOAD_TIME_MS,
         "database_ready": db_ready,
+        "email_transport": _email_transport(),   # relay | smtp | sin configurar (sin datos secretos)
     }
 
 
